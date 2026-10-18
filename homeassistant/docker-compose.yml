@@ -1,0 +1,32 @@
+# Self-hosted Home Assistant plus the ESPHome dashboard.
+#
+#   cd homeassistant && docker compose up -d
+#
+# Home Assistant: http://<host>:8123   ESPHome dashboard: http://<host>:6052
+# Host networking is needed so both can discover ESPHome devices via mDNS.
+
+services:
+  homeassistant:
+    container_name: homeassistant
+    image: ghcr.io/home-assistant/home-assistant:stable
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      TZ: Europe/London
+    volumes:
+      - ./config:/config
+      # The repo's blueprint, mounted read-only so updates arrive with git pull.
+      - ./blueprints/automation/distributed-sensor-system:/config/blueprints/automation/distributed-sensor-system:ro
+      - /etc/localtime:/etc/localtime:ro
+      - /run/dbus:/run/dbus:ro
+
+  esphome:
+    container_name: esphome
+    image: ghcr.io/esphome/esphome:stable
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      TZ: Europe/London
+    volumes:
+      - ../esphome:/config
+      - /etc/localtime:/etc/localtime:ro
