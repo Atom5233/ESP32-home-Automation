@@ -1,0 +1,23 @@
+# Example room lighting automations using the blueprint.
+# Copy into your Home Assistant automations.yaml (or create them in the UI
+# from Settings > Automations > Create > "Room occupancy lighting").
+# Replace light.living_room with your own lights. For a room without a spot,
+# leave out the spot_ settings.
+
+- id: room_lighting_living_room
+  alias: "Lighting - Living Room"
+  use_blueprint:
+    path: distributed-sensor-system/room_lighting.yaml
+    input:
+      presence_sensor: binary_sensor.ground_floor_living_room_presence
+      motion_sensor: binary_sensor.ground_floor_living_room_motion
+      illuminance_sensor: sensor.ground_floor_living_room_illuminance
+      doorway_sensors:
+        - binary_sensor.ground_floor_living_room_door
+      lights:
+        - light.living_room
+      # Sat on the sofa for 20 minutes -> lights off until you get up.
+      spot_sensors:
+        - binary_sensor.ground_floor_living_room_sofa
+      spot_minutes: 20
+      relight_on_leaving_spot: true
