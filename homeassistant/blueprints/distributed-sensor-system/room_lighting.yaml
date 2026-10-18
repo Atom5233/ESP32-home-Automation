@@ -1,0 +1,372 @@
+blueprint:
+  name: Room occupancy lighting
+  author: distributed-sensor-system
+  description: >-
+    Drives one room's lights from the sensor network.
+
+    * Doorway beam broken while the room is empty and dark: lights on at once.
+    * Presence or motion while dark: lights on.
+    * Nobody confirmed after a doorway event: lights off after the entry grace period.
+    * Room empty for the vacancy timeout: lights off.
+    * Occupants still (presence but no motion) for the stillness timeout: lights off;
+      any movement turns them back on.
+    * Someone in a spot (sofa, bed, desk...) for the spot time: lights off, and they
+      stay off while that person stays in the spot. Leaving the spot can turn them back on.
+  domain: automation
+  input:
+    sensors:
+      name: Sensors
+      input:
+        presence_sensor:
+          name: Presence sensor (mmWave)
+          description: Detects people even when they are still.
+          selector:
+            entity:
+              filter:
+                - domain: binary_sensor
+        motion_sensor:
+          name: Motion sensor (PIR)
+          description: Detects movement only. Used to tell "still" from "gone".
+          selector:
+            entity:
+              filter:
+                - domain: binary_sensor
+        illuminance_sensor:
+          name: Illuminance sensor
+          selector:
+            entity:
+              filter:
+                - domain: sensor
+                  device_class: illuminance
+        doorway_sensors:
+          name: Doorway beam sensors
+          description: Every doorway laser sensor that leads into this room.
+          default: []
+          selector:
+            entity:
+              multiple: true
+              filter:
+                - domain: binary_sensor
+    lighting:
+      name: Lights
+      input:
+        lights:
+          name: Lights
+          selector:
+            entity:
+              multiple: true
+              filter:
+                - domain: light
+        lux_threshold:
+          name: Darkness threshold
+          description: Only switch lights on when the room is darker than this.
+          default: 40
+          selector:
+            number:
+              min: 0
+              max: 1000
+              step: 5
+              unit_of_measurement: lx
+    timing:
+      name: Timing
+      input:
+        vacancy_minutes:
+          name: Vacancy timeout
+          description: Lights off once presence has been clear this long.
+          default: 2
+          selector:
+            number:
+              min: 1
+              max: 60
+              unit_of_measurement: min
+        stillness_minutes:
+          name: Stillness timeout
+          description: Lights off when people are present but haven't moved this long.
+          default: 60
+          selector:
+            number:
+              min: 5
+              max: 240
+              unit_of_measurement: min
+        entry_grace_seconds:
+          name: Entry grace period
+          description: >-
+            After a doorway event, how long presence may stay clear before the
+            lights the doorway turned on are switched off again.
+          default: 30
+          selector:
+            number:
+              min: 5
+              max: 300
+              unit_of_measurement: s
+    spot:
+      name: Spot
+      input:
+        spot_sensors:
+          name: Spot sensors (optional)
+          description: >-
+            Binary sensors that are on while someone is in a particular spot,
+            e.g. the controller's "Living Room Sofa" sensor.
+          default: []
+          selector:
+            entity:
+              multiple: true
+              filter:
+                - domain: binary_sensor
+        spot_minutes:
+          name: Time in spot before lights off
+          default: 20
+          selector:
+            number:
+              min: 1
+              max: 240
+              unit_of_measurement: min
+        relight_on_leaving_spot:
+          name: Lights back on when leaving the spot
+          description: Turn the lights back on (if it's dark) when the person gets up.
+          default: true
+          selector:
+            boolean:
+    control:
+      name: Control
+      input:
+        enable_entities:
+          name: Enable switches (optional)
+          description: >-
+            The automation only acts while all of these are on. Use one for a
+            house-wide switch and, for bedrooms, a night-mode toggle or schedule.
+          default: []
+          selector:
+            entity:
+              multiple: true
+              filter:
+                - domain:
+                    - input_boolean
+                    - switch
+                    - schedule
+
+mode: queued
+max: 10
+max_exceeded: silent
+
+triggers:
+  - trigger: state
+    entity_id: !input doorway_sensors
+    from: "off"
+    to: "on"
+    id: doorway
+  - trigger: state
+    entity_id: !input doorway_sensors
+    from: "on"
+    to: "off"
+    for:
+      seconds: !input entry_grace_seconds
+    id: entry_timeout
+  # from: "off" so a controller reboot (unavailable -> on) is not mistaken
+  # for someone arriving.
+  - trigger: state
+    entity_id:
+      - !input presence_sensor
+      - !input motion_sensor
+    from: "off"
+    to: "on"
+    id: occupied
+  - trigger: state
+    entity_id: !input presence_sensor
+    to: "off"
+    for:
+      minutes: !input vacancy_minutes
+    id: vacant
+  - trigger: state
+    entity_id: !input motion_sensor
+    to: "off"
+    for:
+      minutes: !input stillness_minutes
+    id: still
+  # Safety net for the stillness and spot rules: "for" timers are lost when
+  # Home Assistant restarts, so re-check every few minutes.
+  - trigger: time_pattern
+    minutes: "/5"
+    id: periodic
+  - trigger: state
+    entity_id: !input spot_sensors
+    to: "on"
+    for:
+      minutes: !input spot_minutes
+    id: spot_dwell
+  - trigger: state
+    entity_id: !input spot_sensors
+    from: "on"
+    to: "off"
+    id: spot_left
+
+variables:
+  presence_entity: !input presence_sensor
+  motion_entity: !input motion_sensor
+  lights: !input lights
+  light_list: "{{ lights if lights is list else [lights] }}"
+  illuminance_entity: !input illuminance_sensor
+  lux_threshold: !input lux_threshold
+  vacancy_minutes: !input vacancy_minutes
+  stillness_minutes: !input stillness_minutes
+  spot_sensors: !input spot_sensors
+  spot_list: "{{ spot_sensors if spot_sensors is list else [spot_sensors] }}"
+  spot_minutes: !input spot_minutes
+  relight_on_leaving_spot: !input relight_on_leaving_spot
+  enable_entities: !input enable_entities
+  enabled: >-
+    {{ (enable_entities if enable_entities is list else [enable_entities])
+       | reject('is_state', 'on') | list | count == 0 }}
+  any_light_on: "{{ light_list | select('is_state', 'on') | list | count > 0 }}"
+  # A room whose lights are already on reads bright because of them, so it
+  # still counts as needing light. An unavailable sensor reads 0 lx, which
+  # fails safe towards lights on.
+  needs_light: >-
+    {{ any_light_on or (states(illuminance_entity) | float(0)) < (lux_threshold | float) }}
+  # Someone has been in a spot for at least the spot time: keep lights off.
+  # (1 s of slack so the check agrees with the trigger that fired at exactly that time.)
+  spot_hold: >-
+    {% set cutoff = now() - timedelta(minutes=spot_minutes | float) + timedelta(seconds=1) %}
+    {{ expand(spot_list) | selectattr('state', 'eq', 'on')
+       | selectattr('last_changed', 'le', cutoff) | list | count > 0 }}
+  # Present but no movement for the stillness timeout.
+  still: >-
+    {% set m = expand(motion_entity) | list %}
+    {{ is_state(presence_entity, 'on') and m | count > 0 and m[0].state == 'off'
+       and m[0].last_changed <= now() - timedelta(minutes=stillness_minutes | float) + timedelta(seconds=1) }}
+  # Only switch lights off for stillness or a spot if they were already on
+  # when that began. If someone switched them on afterwards (to read on the
+  # sofa, say), respect that. 2 s of slack covers the automation's own switch-on.
+  still_off_ok: >-
+    {% set on = expand(light_list) | selectattr('state', 'eq', 'on')
+       | map(attribute='last_changed') | list %}
+    {% set m = expand(motion_entity) | list %}
+    {{ on | count > 0 and m | count > 0
+       and (on | max) <= m[0].last_changed + timedelta(seconds=2) }}
+  spot_off_ok: >-
+    {% set on = expand(light_list) | selectattr('state', 'eq', 'on')
+       | map(attribute='last_changed') | list %}
+    {% set cutoff = now() - timedelta(minutes=spot_minutes | float) + timedelta(seconds=1) %}
+    {{ on | count > 0 and expand(spot_list) | selectattr('state', 'eq', 'on')
+       | selectattr('last_changed', 'le', cutoff)
+       | selectattr('last_changed', 'ge', (on | max) - timedelta(seconds=2))
+       | list | count > 0 }}
+  # For presence triggers: how long presence had been clear before it came back.
+  # A short gap is a radar dropout; a long one is a real arrival.
+  presence_gap_seconds: >-
+    {% if trigger.platform == 'state' and trigger.entity_id == presence_entity
+          and trigger.from_state is not none %}
+      {{ (trigger.to_state.last_changed - trigger.from_state.last_changed).total_seconds() }}
+    {% else %}0{% endif %}
+
+conditions:
+  - condition: template
+    value_template: "{{ enabled }}"
+
+actions:
+  - choose:
+      - alias: Doorway into an empty, dark room
+        conditions:
+          - condition: trigger
+            id: doorway
+          - condition: state
+            entity_id: !input presence_sensor
+            state: "off"
+          - condition: template
+            value_template: "{{ needs_light and not any_light_on }}"
+        sequence:
+          - action: light.turn_on
+            target:
+              entity_id: "{{ light_list }}"
+
+      - alias: Nobody arrived after a doorway event
+        conditions:
+          - condition: trigger
+            id: entry_timeout
+          - condition: state
+            entity_id: !input presence_sensor
+            state: "off"
+            for:
+              seconds: !input entry_grace_seconds
+          - condition: template
+            value_template: "{{ any_light_on }}"
+        sequence:
+          - action: light.turn_off
+            target:
+              entity_id: "{{ light_list }}"
+
+      - alias: Someone present or moving in the dark
+        conditions:
+          - condition: trigger
+            id: occupied
+          - condition: template
+            value_template: "{{ needs_light and not any_light_on and not spot_hold }}"
+          # Motion always counts. Presence returning only counts if it's a real
+          # arrival, not a radar dropout over someone sitting still.
+          - condition: template
+            value_template: >-
+              {{ trigger.entity_id == motion_entity or not still
+                 or (presence_gap_seconds | float) >= (vacancy_minutes | float) * 60 }}
+        sequence:
+          - action: light.turn_on
+            target:
+              entity_id: "{{ light_list }}"
+
+      - alias: Room empty
+        conditions:
+          - condition: trigger
+            id: vacant
+          - condition: template
+            value_template: "{{ any_light_on }}"
+        sequence:
+          - action: light.turn_off
+            target:
+              entity_id: "{{ light_list }}"
+
+      - alias: Occupants still for too long
+        conditions:
+          - condition: trigger
+            id: still
+          - condition: template
+            value_template: "{{ still and still_off_ok }}"
+        sequence:
+          - action: light.turn_off
+            target:
+              entity_id: "{{ light_list }}"
+
+      - alias: Someone in the spot for long enough
+        conditions:
+          - condition: trigger
+            id: spot_dwell
+          - condition: template
+            value_template: "{{ spot_off_ok }}"
+        sequence:
+          - action: light.turn_off
+            target:
+              entity_id: "{{ light_list }}"
+
+      - alias: Periodic check for stillness or spot
+        conditions:
+          - condition: trigger
+            id: periodic
+          - condition: template
+            value_template: "{{ (still and still_off_ok) or (spot_hold and spot_off_ok) }}"
+        sequence:
+          - action: light.turn_off
+            target:
+              entity_id: "{{ light_list }}"
+
+      - alias: Got up from the spot
+        conditions:
+          - condition: trigger
+            id: spot_left
+          - condition: template
+            value_template: >-
+              {{ relight_on_leaving_spot and not spot_hold and needs_light and not any_light_on
+                 and is_state(presence_entity, 'on')
+                 and (trigger.to_state.last_changed - trigger.from_state.last_changed).total_seconds()
+                     >= (spot_minutes | float) * 60 - 1 }}
+        sequence:
+          - action: light.turn_on
+            target:
+              entity_id: "{{ light_list }}"
