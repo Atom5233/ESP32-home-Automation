@@ -1,0 +1,261 @@
+# ESP32 sensor controller - ESPHome firmware.
+#
+# One controller with one room wired to it: climate, light, mmWave presence
+# with spot detection, PIR motion and a laser doorway beam.
+#
+# Before flashing: copy secrets.yaml.example to secrets.yaml and fill it in.
+# Flash:  esphome run sensor-controller.yaml   (first time over USB, then OTA)
+#
+# ---------------------------------------------------------------------------
+# WIRING
+# ---------------------------------------------------------------------------
+# ESP32 DevKit (WROOM-32) -> root I2C bus (keep these wires short)
+#   3V3            -> TCA9548A VIN, MCP23017 VDD (pin 9) and RESET (pin 18)
+#   GND            -> TCA9548A GND, MCP23017 VSS (pin 10) and A0/A1/A2 (pins 15-17)
+#   GPIO21 (SDA)   -> TCA9548A SDA, MCP23017 SDA (pin 13)
+#   GPIO22 (SCL)   -> TCA9548A SCL, MCP23017 SCL (pin 12)
+#
+# TCA9548A channel 0 (SD0 / SC0) -> room I2C sensors, all powered from 3V3:
+#   BME280   0x76  temperature, humidity, pressure (SDO to GND)
+#   BH1750   0x23  light (ADDR to GND)
+#   VL53L0X  0x29  doorway laser beam
+#   The TCA9548A has no pull-ups on its channel side, so KEEP the pull-up
+#   resistors fitted on the sensor breakout boards for this bench build.
+#   (For long Cat5e runs, remove them and fit sized pull-ups at the controller.)
+#
+# HLK-LD2410C mmWave radar -> ESP32 UART2
+#   LD2410C VCC    -> 5V (ESP32 VIN pin when powered over USB)
+#   LD2410C GND    -> GND
+#   LD2410C TX     -> GPIO16 (RX2)
+#   LD2410C RX     -> GPIO17 (TX2)
+#   (GPIO16/17 are free on WROOM-32 boards; on WROVER boards pick other pins.)
+#
+# AM312 PIR -> MCP23017
+#   AM312 VCC      -> 3V3
+#   AM312 OUT      -> MCP23017 GPA0 (pin 21), plus 10k pull-down to GND
+# ---------------------------------------------------------------------------
+
+substitutions:
+  device_name: ground-floor
+  friendly_name: Ground Floor
+  room_name: Living Room
+  door_name: Living Room Door
+  spot_name: Sofa
+  # Doorway: set ~0.15 m below the distance the laser reads with the door clear.
+  beam_threshold_m: "0.65"
+  # Spot: starting values only. Fine-tune them from Home Assistant.
+  spot_start_cm: "150"
+  spot_end_cm: "250"
+  i2c_frequency: 50kHz
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+  project:
+    name: "distributed-sensor-system.controller"
+    version: "1.1.0"
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+logger:
+
+api:
+  encryption:
+    key: !secret api_key
+
+ota:
+  - platform: esphome
+    encryption: {}
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "${friendly_name} Fallback"
+    password: !secret ap_password
+
+captive_portal:
+
+# --- Buses -------------------------------------------------------------------
+i2c:
+  - id: i2c_root
+    sda: GPIO21
+    scl: GPIO22
+    frequency: ${i2c_frequency}
+    scan: true
+
+tca9548a:
+  - id: i2c_mux
+    i2c_id: i2c_root
+    address: 0x70
+    channels:
+      - bus_id: room_bus
+        channel: 0
+
+mcp23017:
+  - id: room_inputs
+    i2c_id: i2c_root
+    address: 0x20
+
+uart:
+  - id: radar_uart
+    rx_pin: GPIO16
+    tx_pin: GPIO17
+    baud_rate: 256000
+    parity: NONE
+    stop_bits: 1
+
+ld2410:
+  - id: radar
+    uart_id: radar_uart
+
+# --- Spot settings, adjustable from Home Assistant ------------------------------
+number:
+  - platform: template
+    id: spot_start
+    name: "${spot_name} Spot Start"
+    icon: mdi:ray-start
+    unit_of_measurement: cm
+    min_value: 0
+    max_value: 600
+    step: 5
+    initial_value: ${spot_start_cm}
+    optimistic: true
+    restore_value: true
+    entity_category: config
+
+  - platform: template
+    id: spot_end
+    name: "${spot_name} Spot End"
+    icon: mdi:ray-end
+    unit_of_measurement: cm
+    min_value: 0
+    max_value: 600
+    step: 5
+    initial_value: ${spot_end_cm}
+    optimistic: true
+    restore_value: true
+    entity_category: config
+
+  # Radar tuning (these three must be configured together).
+  - platform: ld2410
+    ld2410_id: radar
+    timeout:
+      name: "${room_name} Radar Hold Time"
+    max_move_distance_gate:
+      name: "${room_name} Radar Max Move Gate"
+    max_still_distance_gate:
+      name: "${room_name} Radar Max Still Gate"
+
+# --- Sensors -------------------------------------------------------------------
+sensor:
+  - platform: bme280_i2c
+    i2c_id: room_bus
+    address: 0x76
+    update_interval: 60s
+    temperature:
+      name: "${room_name} Temperature"
+      oversampling: 2x
+    humidity:
+      name: "${room_name} Humidity"
+      oversampling: 2x
+    pressure:
+      name: "${room_name} Pressure"
+      oversampling: 4x
+
+  - platform: bh1750
+    i2c_id: room_bus
+    address: 0x23
+    name: "${room_name} Illuminance"
+    update_interval: 15s
+
+  - platform: vl53l0x
+    id: door_distance
+    name: "${door_name} Distance"
+    i2c_id: room_bus
+    address: 0x29
+    update_interval: 100ms
+    long_range: false
+    internal: true  # set to false while calibrating beam_threshold_m
+
+  - platform: ld2410
+    ld2410_id: radar
+    detection_distance:
+      id: target_distance
+      name: "${room_name} Target Distance"
+      # The radar reports ~10x a second and jitters by a few cm:
+      # smooth it, and only send real changes to Home Assistant.
+      filters:
+        - median:
+            window_size: 5
+            send_every: 2
+        - delta: 5
+
+  - platform: wifi_signal
+    name: "Wi-Fi Signal"
+    update_interval: 60s
+    entity_category: diagnostic
+
+  - platform: uptime
+    name: "Uptime"
+    entity_category: diagnostic
+
+# --- Binary sensors ------------------------------------------------------------
+binary_sensor:
+  - platform: ld2410
+    ld2410_id: radar
+    has_target:
+      id: radar_presence
+      name: "${room_name} Presence"
+    has_still_target:
+      name: "${room_name} Still Target"
+      entity_category: diagnostic
+
+  # Someone is in the spot: the radar's target is between Spot Start and
+  # Spot End. delayed_off rides through brief radar dropouts and jitter at
+  # the edges, so the dwell timer in Home Assistant doesn't keep restarting.
+  - platform: template
+    id: spot
+    name: "${room_name} ${spot_name}"
+    device_class: occupancy
+    lambda: |-
+      if (!id(radar_presence).state) return false;
+      const float d = id(target_distance).state;
+      if (std::isnan(d)) return false;
+      // Accept the band either way round, in case Start and End get swapped.
+      const float lo = std::min(id(spot_start).state, id(spot_end).state);
+      const float hi = std::max(id(spot_start).state, id(spot_end).state);
+      return d >= lo && d <= hi;
+    filters:
+      - delayed_on: 3s
+      - delayed_off: 15s
+
+  - platform: gpio
+    name: "${room_name} Motion"
+    device_class: motion
+    pin:
+      mcp23xxx: room_inputs
+      number: 0
+      mode:
+        input: true
+    filters:
+      - delayed_on: 50ms
+
+  - platform: template
+    name: "${door_name}"
+    device_class: occupancy
+    lambda: |-
+      const float d = id(door_distance).state;
+      return !std::isnan(d) && d < ${beam_threshold_m};
+    filters:
+      - delayed_off: 500ms
+
+  - platform: status
+    name: "Controller Status"
+
+button:
+  - platform: restart
+    name: "Restart Controller"
