@@ -1,0 +1,5 @@
+esphome/secrets.yaml
+esphome/.esphome/
+# Home Assistant runtime data (database, credentials) created by docker compose
+homeassistant/config/
+__pycache__/
